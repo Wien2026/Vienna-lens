@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vienna Lens – Full</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{--bg:#f2f4f3;--fg:#18222b;--mut:#66727c;--card:#fff;--ac:#1f6f5c;--bd:#d9dfdc;--warn:#9a5b00}
+@media (prefers-color-scheme:dark){:root{--bg:#10171c;--fg:#e8eeee;--mut:#8d9aa3;--card:#18222a;--ac:#5bc2a6;--bd:#2a3740;--warn:#e0a84a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:560px;margin:0 auto;padding:18px 16px 48px}
+h1{font:700 26px Georgia,serif;margin:0}
+.sub{color:var(--mut);font-size:14px;margin:2px 0 16px}
+.btn{width:100%;border:0;border-radius:12px;padding:16px;font:600 17px system-ui,sans-serif;background:var(--ac);color:var(--bg);cursor:pointer}
+.btn:disabled{opacity:.5}
+.row{display:flex;gap:8px;margin-top:14px}
+.row input{flex:1;min-width:0;padding:13px;border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);font:16px system-ui}
+.row .btn{width:auto;padding:13px 18px}
+.status{font-size:13px;color:var(--mut);margin-top:10px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-top:14px}
+.card h2{font:700 22px Georgia,serif;margin:0}
+.meta{color:var(--mut);font-size:14px}
+.fact{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid var(--bd);font-size:15px}
+.fact b{font-weight:600}.fact span{color:var(--mut);font-size:13px;text-align:right}
+.hist p{margin:8px 0}
+.src{font-size:12px;color:var(--mut)}
+.alt{display:block;width:100%;text-align:left;margin-top:6px;padding:10px 12px;border:1px solid var(--bd);border-radius:10px;background:transparent;color:var(--fg);font:15px system-ui}
+.links a{display:block;margin-top:8px;padding:11px 14px;border:1px solid var(--bd);border-radius:10px;color:var(--ac);text-decoration:none;font-weight:600;font-size:15px}
+.warn{color:var(--warn);font-size:13px;margin-top:10px}
+#vid{width:100%;max-height:55vh;object-fit:cover;border-radius:12px;background:#000;margin-bottom:12px;display:none}
+h3{font-size:14px;color:var(--mut);margin:16px 0 4px;font-weight:600}
+</style>
+</head>
+<body>
+<main>
+  <h1>Vienna Lens</h1>
+  <p class="sub">Point your phone at a building and tap the button.</p>
+  <video id="vid" playsinline muted autoplay></video>
+  <button class="btn" id="go">📷 Show camera and find the building I’m facing</button>
+  <div class="status" id="st">Compass: – · Location: –</div>
+  <div class="row">
+    <input id="addr" placeholder="Or type an address, e.g. Freyung 4" enterkeyhint="search">
+    <button class="btn" id="goA">Go</button>
+  </div>
+  <div id="out"></div>
+  <p class="src">Data: OpenStreetMap, Wikidata, Wien Geschichte Wiki. Facts are shown with their source; missing data is left blank rather than guessed.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; };
+const out = $('out');
+let heading = null, here = null, compassOn = false;
+
+async function getJSON(url){
+  const c = new AbortController(), t = setTimeout(() => c.abort(), 9000);
+  try{
+    const r = await fetch(url, {signal:c.signal});
+    if(!r.ok) throw new Error('Request failed (' + r.status + ')');
+    return await r.json();
+  }catch(e){
+    throw new Error(e.name === 'AbortError' ? 'Request timed out' : e.message);
+  }finally{ clearTimeout(t); }
+}
+const withTimeout = (p, ms) => Promise.race([p, new Promise(r => setTimeout(r, ms))]);
+function status(){
+  $('st').textContent = 'Compass: ' + (heading == null ? 'not available' : Math.round(heading) + '°') +
+    ' · Location: ' + (here ? 'ok (±' + Math.round(here.acc) + ' m)' : '–');
+}
+
+/* ---------- compass ---------- */
+async function startCompass(){
+  if(compassOn) return;
+  try{
+    if(typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission){
+      if(await DeviceOrientationEvent.requestPermission() !== 'granted') return;
+    }
+    const h = e => {
+      let v = null;
+      if(e.webkitCompassHeading != null) v = e.webkitCompassHeading;
+      else if(e.absolute && e.alpha != null) v = (360 - e.alpha) % 360;
+      if(v != null){ heading = v; status(); }
+    };
+    addEventListener('deviceorientationabsolute', h, true);
+    addEventListener('deviceorientation', h, true);
+    compassOn = true;
+  }catch(e){}
+}
+
+/* ---------- location ---------- */
+function getPos(){
+  return new Promise((res, rej) => {
+    if(!navigator.geolocation) return rej(new Error('Location is not supported.'));
+    navigator.geolocation.getCurrentPosition(
+      p => res({lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy}),
+      () => rej(new Error('Location is blocked. Allow location for this page in your browser settings.')),
+      {enableHighAccuracy:true, timeout:10000, maximumAge:5000});
+  });
+}
+
+/* ---------- geometry ---------- */
+const rad = d => d * Math.PI / 180;
+function distBearing(a, b){
+  const dy = (b.lat - a.lat) * 111320;
+  const dx = (b.lon - a.lon) * 111320 * Math.cos(rad(a.lat));
+  return {d: Math.hypot(dx, dy), br: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360};
+}
+const angDiff = (a, b) => { const x = Math.abs(a - b) % 360; return x > 180 ? 360 - x : x; };
+
+/* ---------- find buildings ---------- */
+async function findBuildings(){
+  const q = `[out:json][timeout:8];way(around:100,${here.lat},${here.lon})["building"];out tags center;`;
+  const servers = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+  let d = null, lastErr = null;
+  for(let round = 0; round < 2 && !d; round++){
+    for(const s of servers){
+      try{ d = await getJSON(s + '?data=' + encodeURIComponent(q)); break; }
+      catch(e){ lastErr = e; }
+    }
+    if(!d) await new Promise(r => setTimeout(r, 1500));
+  }
+  if(!d) throw new Error('The map data servers are busy right now (' + (lastErr ? lastErr.message : 'no answer') + '). Wait a minute and tap the button again.');
+  const list = (d.elements || []).filter(e => e.center).map(e => {
+    const c = {lat:e.center.lat, lon:e.center.lon};
+    const g = distBearing(here, c);
+    const diff = heading == null ? 0 : angDiff(g.br, heading);
+    const named = (e.tags['name'] || e.tags['addr:housenumber']) ? 0 : 15;
+    return {tags:e.tags, c, d:g.d, diff, score: g.d + diff * 0.8 + named};
+  });
+  list.sort((a, b) => a.score - b.score);
+  let ahead = list.filter(b => heading == null || b.diff <= 60);
+  let fallback = false;
+  if(!ahead.length && list.length){ ahead = list; fallback = true; }
+  ahead = ahead.slice(0, 4);
+  ahead.fallback = fallback;
+  return ahead;
+}
+
+async function reverse(c){
+  try{
+    const r = await getJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&extratags=1&zoom=18&lat=${c.lat}&lon=${c.lon}`);
+    return r;
+  }catch(e){ return null; }
+}
+
+/* ---------- facts ---------- */
+const yearOf = s => { const m = /^[+-]?(\d{3,4})/.exec(s || ''); return m ? m[1] : null; };
+
+async function wikidata(id){
+  try{
+    const d = await getJSON(`https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${id}&props=labels|descriptions|claims&languages=de|en&format=json&origin=*`);
+    const e = d.entities[id];
+    const inc = e.claims && e.claims.P571 && e.claims.P571[0].mainsnak.datavalue;
+    return {
+      label: (e.labels.de || e.labels.en || {}).value,
+      desc: (e.descriptions.de || e.descriptions.en || {}).value,
+      year: inc ? yearOf(inc.value.time) : null
+    };
+  }catch(e){ return null; }
+}
+
+async function wiki(term){
+  const base = 'https://www.geschichtewiki.wien.gv.at/api.php?format=json&origin=*&';
+  try{
+    const s = await getJSON(base + 'action=query&list=search&srlimit=1&srsearch=' + encodeURIComponent(term));
+    const hit = s.query && s.query.search && s.query.search[0];
+    if(!hit) return null;
+    let text = null;
+    try{
+      const x = await getJSON(base + 'action=query&prop=extracts&exintro=1&explaintext=1&exsentences=3&titles=' + encodeURIComponent(hit.title));
+      const p = Object.values(x.query.pages)[0];
+      text = p && p.extract;
+    }catch(e){}
+    if(!text) text = hit.snippet.replace(/<[^>]+>/g, '');
+    return {title:hit.title, text, url:'https://www.geschichtewiki.wien.gv.at/' + hit.title.replace(/ /g, '_')};
+  }catch(e){ return null; }
+}
+
+/* ---------- archive links ---------- */
+const clean = s => (s || '').replace(/\s*\(.*?\)/g, '').replace(/,?\s*\b1\d{3}\b/g, '').replace(/,?\s*\b(Wien|Vienna|Österreich|Austria)\b/gi, '').replace(/^[,\s]+|[,\s]+$/g, '').trim();
+function links(name, addr){
+  const term = clean(name) || addr, sq = addr || term;
+  if(!term) return '';
+  const L = [
+    ['Wien Museum – old photos', 'https://sammlung.wienmuseum.at/suche/?fullText=' + encodeURIComponent(sq) + '&sort=RELEVANCE&layout=NORMAL'],
+    ['Zeitensprünge – then & now', 'https://www.zeitenspruenge.at/suchen?q=' + encodeURIComponent(sq)],
+    ['Kulturpool – Austrian archives', 'https://kulturpool.at/en/search?query=' + encodeURIComponent(term)],
+    ['Wien Geschichte Wiki', 'https://www.geschichtewiki.wien.gv.at/Spezial:Suche?search=' + encodeURIComponent(term)]
+  ];
+  return '<h3>Old pictures & history</h3><div class="links">' + L.map(x => `<a href="${x[1]}" target="_blank" rel="noopener">${x[0]}</a>`).join('') + '</div>';
+}
+
+/* ---------- show one building ---------- */
+async function showBuilding(b){
+  const t = b.tags;
+  out.innerHTML = '<div class="card meta">Loading facts…</div>';
+  let street = t['addr:street'], num = t['addr:housenumber'], name = t['name'] || t['name:de'];
+  let osmYear = yearOf(t['start_date']), qid = t['wikidata'];
+  if(!street || !num){
+    const r = await reverse(b.c);
+    if(r && r.address){
+      street = street || r.address.road; num = num || r.address.house_number;
+      if(r.extratags){ qid = qid || r.extratags.wikidata; osmYear = osmYear || yearOf(r.extratags.start_date); }
+      name = name || (r.name && r.name !== street ? r.name : null);
+    }
+  }
+  const addr = [street, num].filter(Boolean).join(' ');
+  const wd = qid ? await wikidata(qid) : null;
+  if(wd && wd.label && !name) name = wd.label;
+  const year = osmYear || (wd && wd.year);
+  const yearSrc = osmYear ? 'OpenStreetMap' : (wd && wd.year ? 'Wikidata' : '');
+  const w = await wiki(clean(name) || addr);
+  out.innerHTML = `<div class="card">
+    <h2>${esc(name || addr || 'Unnamed building')}</h2>
+    ${name && addr ? `<div class="meta">${esc(addr)}</div>` : ''}
+    ${wd && wd.desc ? `<div class="meta">${esc(wd.desc)}</div>` : ''}
+    <div class="fact"><b>Year built</b><span>${year ? esc(year) + ' · ' + yearSrc : 'not found in data'}</span></div>
+    ${t['building:architecture'] || t['architect'] ? `<div class="fact"><b>Style / architect</b><span>${esc(t['architect'] || t['building:architecture'])} · OpenStreetMap</span></div>` : ''}
+    ${w ? `<div class="hist"><h3>From Wien Geschichte Wiki</h3><p>${esc(w.text)}</p><a class="src" href="${w.url}" target="_blank" rel="noopener">Read the full article</a></div>` : '<div class="warn">No matching Wien Geschichte Wiki article found. Try the links below.</div>'}
+    ${links(name, addr)}
+  </div>`;
+}
+
+function showList(list){
+  if(!list.length){ out.innerHTML = '<div class="card warn">No building found in that direction. Move closer or try the address field.</div>'; return; }
+  showBuilding(list[0]).then(() => {
+    if(list.fallback){
+      const n = document.createElement('div');
+      n.className = 'warn';
+      n.textContent = 'No building matched your compass direction, so these are the nearest buildings. Hold the iPad upright in portrait and try again.';
+      out.appendChild(n);
+    }
+    if(list.length > 1){
+      const alt = document.createElement('div');
+      alt.className = 'card';
+      alt.innerHTML = '<h3 style="margin-top:0">Not the right one?</h3>';
+      list.forEach(b => {
+        const t = b.tags;
+        const label = (t.name || [t['addr:street'], t['addr:housenumber']].filter(Boolean).join(' ') || 'Building') + ' · ' + Math.round(b.d) + ' m';
+        const btn = document.createElement('button');
+        btn.className = 'alt'; btn.textContent = label;
+        btn.onclick = () => showBuilding(b).then(() => out.appendChild(alt));
+        alt.appendChild(btn);
+      });
+      out.appendChild(alt);
+    }
+  });
+}
+
+/* ---------- actions ---------- */
+async function run(fn, btn){
+  btn.disabled = true;
+  try{ await fn(); }
+  catch(e){ out.innerHTML = `<div class="card warn">${esc(e.message || 'Something went wrong.')}</div>`; }
+  finally{ btn.disabled = false; }
+}
+let camOn = false;
+async function startCamera(){
+  if(camOn) return;
+  try{
+    const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false});
+    $('vid').srcObject = s; $('vid').style.display = 'block'; camOn = true;
+    $('go').textContent = '📍 Find the building I’m facing';
+  }catch(e){ /* camera optional: the lookup works without it */ }
+}
+$('go').onclick = () => run(async () => {
+  out.innerHTML = '<div class="card meta">Getting your position…</div>';
+  const compassP = startCompass();   // all three start at once, inside the tap
+  startCamera();
+  const posP = getPos();
+  here = await posP; status();
+  await withTimeout(compassP, 2500); status();
+  out.innerHTML = '<div class="card meta">Searching buildings ahead…</div>';
+  showList(await findBuildings());
+}, $('go'));
+
+async function byAddress(){
+  const a = $('addr').value.trim();
+  if(!a) return;
+  await run(async () => {
+    out.innerHTML = '<div class="card meta">Looking up the address…</div>';
+    const r = await getJSON('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&city=Wien&country=Austria&street=' + encodeURIComponent(a));
+    if(!r.length) throw new Error('Address not found. Check spelling, e.g. “Freyung 4”.');
+    here = {lat:+r[0].lat, lon:+r[0].lon, acc:0}; heading = null;
+    showList(await findBuildings());
+  }, $('goA'));
+}
+$('goA').onclick = byAddress;
+$('addr').addEventListener('keydown', e => { if(e.key === 'Enter') byAddress(); });
+</script>
+</body>
+</html>
